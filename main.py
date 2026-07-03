@@ -25,11 +25,11 @@ from pathlib import Path
 from pathlib import PurePosixPath
 
 import aiohttp
-from astrbot.api.event import AstrMessageEvent, on_command, on_message
+from astrbot.api import star
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.api.all import MessageChain
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
 # ======================== 区域配置 ========================
@@ -666,7 +666,7 @@ class GenshinShowcasePlugin(Star):
 
     # ==================== 指令处理 ====================
     # 参考: https://astrbot.app/dev/plugin-minimal 指令注册章节
-    @on_command("bind_uid")
+    @filter.command("bind_uid")
     async def bind_uid(self, event: AstrMessageEvent):
         """绑定UID指令处理。
 
@@ -678,7 +678,7 @@ class GenshinShowcasePlugin(Star):
         try:
             args = event.message_str.strip().split()
             if len(args) < 2:
-                yield event.plain_message(
+                yield event.plain_result(
                     "❌ 用法: /bind_uid <原神UID>\n"
                     "示例: /bind_uid 123456789"
                 )
@@ -687,7 +687,7 @@ class GenshinShowcasePlugin(Star):
             uid = args[1].strip()
 
             if not validate_uid(uid):
-                yield event.plain_message(
+                yield event.plain_result(
                     "❌ UID格式错误！UID应为9-10位纯数字。\n"
                     f"你输入的是: {uid} (长度{len(uid)})"
                 )
@@ -700,7 +700,7 @@ class GenshinShowcasePlugin(Star):
             save_uid_bindings(bindings)
 
             logger.info(f"UID绑定成功: user={user_id}, uid={uid}")
-            yield event.plain_message(
+            yield event.plain_result(
                 f"✅ UID绑定成功！\n"
                 f"玩家ID: {user_id}\n"
                 f"原神UID: {uid}\n\n"
@@ -709,9 +709,9 @@ class GenshinShowcasePlugin(Star):
 
         except Exception as e:
             logger.error(f"bind_uid指令异常: {e}")
-            yield event.plain_message("❌ 绑定过程中发生错误，请稍后重试。")
+            yield event.plain_result("❌ 绑定过程中发生错误，请稍后重试。")
 
-    @on_command("my_showcase")
+    @filter.command("my_showcase")
     async def my_showcase(self, event: AstrMessageEvent):
         """查询展示窗指令处理。
 
@@ -726,7 +726,7 @@ class GenshinShowcasePlugin(Star):
             bindings = load_uid_bindings()
 
             if user_id not in bindings:
-                yield event.plain_message(
+                yield event.plain_result(
                     "❌ 你还未绑定原神UID！\n"
                     "请使用 /bind_uid <UID> 先绑定你的UID。\n"
                     "示例: /bind_uid 123456789"
@@ -734,13 +734,13 @@ class GenshinShowcasePlugin(Star):
                 return
 
             uid = bindings[user_id]
-            yield event.plain_message(
+            yield event.plain_result(
                 f"⏳ 正在查询 UID {uid} 的展示窗数据..."
             )
 
             data = await fetch_enka_data(uid)
             if data is None:
-                yield event.plain_message(
+                yield event.plain_result(
                     "❌ 查询失败！可能原因：\n"
                     "1. UID不正确或不存在\n"
                     "2. Enka.Network 服务暂时不可用\n"
@@ -752,7 +752,7 @@ class GenshinShowcasePlugin(Star):
 
             characters = extract_showcase_characters(data)
             if not characters:
-                yield event.plain_message(
+                yield event.plain_result(
                     "⚠️ 获取到展示窗数据，但未发现角色信息。\n"
                     "请确认你的原神展示窗中有角色展示。"
                 )
@@ -772,7 +772,7 @@ class GenshinShowcasePlugin(Star):
                 if name not in self.alias_map:
                     self.alias_map[name] = name
 
-            yield event.plain_message(
+            yield event.plain_result(
                 f"✅ UID {uid} 的展示窗角色列表：\n"
                 f"{name_list}\n\n"
                 f"共 {len(char_names)} 个角色。\n"
@@ -781,13 +781,13 @@ class GenshinShowcasePlugin(Star):
 
         except Exception as e:
             logger.error(f"my_showcase指令异常: {e}")
-            yield event.plain_message(
+            yield event.plain_result(
                 "❌ 查询过程中发生错误，请检查日志或稍后重试。"
             )
 
     # ==================== 消息监听 ====================
     # 参考: https://astrbot.app/dev/plugin-minimal 消息事件章节
-    @on_message()
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_character_query(self, event: AstrMessageEvent):
         """监听纯文本消息，匹配角色名时回复详情卡片。
 
@@ -834,22 +834,22 @@ class GenshinShowcasePlugin(Star):
             # 合成卡片
             card_bytes = await generate_character_card(matched_char)
             if card_bytes is None:
-                yield event.plain_message(
+                yield event.plain_result(
                     "❌ 卡片生成失败，请稍后重试。"
                 )
                 return
 
-            # 通过AstrBot官方MessageChain发送图片（参考文转图规范）
-            # 禁止直接发送文件路径，必须使用消息组件
-            from astrbot.api.message_components import Image
-
-            image_component = Image.fromBytes(card_bytes)
-            yield MessageChain([image_component])
+            # 通过AstrBot官方API发送图片（参考文转图规范）
+            # 使用 Image.fromBytes 创建图片组件
+            image_component = Image.fromBytes(card_bytes.getvalue())
+            result = event.make_result()
+            result.chain.append(image_component)
+            yield result
 
         except Exception as e:
             logger.error(f"角色查询监听异常: {e}")
             try:
-                yield event.plain_message(
+                yield event.plain_result(
                     "❌ 角色卡片生成出错，请稍后重试。"
                 )
             except Exception:
