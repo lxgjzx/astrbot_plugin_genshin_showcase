@@ -1,0 +1,7 @@
+name: astrbot_plugin_genshin_showcase
+version: 1.0.0
+description: AstrBot原神角色展示窗插件，支持绑定UID、查询展示窗角色列表、生成角色详情合成卡片
+author: astrbot_plugin_genshin_showcase
+license: MIT
+repository: ""
+min_version: "3.0.0"
