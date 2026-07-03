@@ -25,11 +25,11 @@ from pathlib import Path
 from pathlib import PurePosixPath
 
 import aiohttp
-from astrbot.api.event import AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, on_command, on_message
 from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.api.all import *
+from astrbot.api.all import MessageChain
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
 # ======================== 区域配置 ========================
@@ -734,11 +734,8 @@ class GenshinShowcasePlugin(Star):
                 return
 
             uid = bindings[user_id]
-            # 提示用户正在查询
-            await event.send(
-                event.plain_message(
-                    f"⏳ 正在查询 UID {uid} 的展示窗数据..."
-                )
+            yield event.plain_message(
+                f"⏳ 正在查询 UID {uid} 的展示窗数据..."
             )
 
             data = await fetch_enka_data(uid)
@@ -834,18 +831,11 @@ class GenshinShowcasePlugin(Star):
                 f"角色卡片触发: user={user_id}, char={matched_char['name']}"
             )
 
-            # 提示正在生成
-            await event.send(
-                event.plain_message(f"⏳ 正在生成「{matched_char['name']}」的详情卡片...")
-            )
-
             # 合成卡片
             card_bytes = await generate_character_card(matched_char)
             if card_bytes is None:
-                await event.send(
-                    event.plain_message(
-                        "❌ 卡片生成失败，请稍后重试。"
-                    )
+                yield event.plain_message(
+                    "❌ 卡片生成失败，请稍后重试。"
                 )
                 return
 
@@ -854,15 +844,13 @@ class GenshinShowcasePlugin(Star):
             from astrbot.api.message_components import Image
 
             image_component = Image.fromBytes(card_bytes)
-            await event.send(MessageChain([image_component]))
+            yield MessageChain([image_component])
 
         except Exception as e:
             logger.error(f"角色查询监听异常: {e}")
             try:
-                await event.send(
-                    event.plain_message(
-                        "❌ 角色卡片生成出错，请稍后重试。"
-                    )
+                yield event.plain_message(
+                    "❌ 角色卡片生成出错，请稍后重试。"
                 )
             except Exception:
                 pass
