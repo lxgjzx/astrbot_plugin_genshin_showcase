@@ -40,6 +40,10 @@ UID_FILE = DATA_DIR / "genshin_showcase_uid.json"
 ALIAS_FILE = ASSETS_DIR / "alias_map.json"
 FONT_FILE = ASSETS_DIR / "SourceHanSansSC-Regular.otf"
 
+# 模块级全局状态（避免 self 绑定问题）
+_user_showcase_cache: dict[str, list[dict]] = {}
+_alias_map: dict[str, str] = {}
+
 ENKA_API_BASE = "https://enka.network/api/uid/{uid}"
 CACHE_TTL = 300  # 5分钟内存缓存（遵守Enka速率限制）
 REQUEST_TIMEOUT = 10  # aiohttp请求超时(秒)
@@ -660,9 +664,8 @@ class GenshinShowcasePlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        self.alias_map = load_alias_map()
-        # 内存中缓存最近一次查询的角色数据 { user_id_str: [character_dict, ...] }
-        self._user_showcase_cache: dict[str, list[dict]] = {}
+        global _alias_map
+        _alias_map = load_alias_map()
 
     # ==================== 指令处理 ====================
     # 参考: https://astrbot.app/dev/plugin-minimal 指令注册章节
@@ -758,9 +761,6 @@ class GenshinShowcasePlugin(Star):
                 )
                 return
 
-            # 缓存角色数据供后续匹配
-            self._user_showcase_cache[user_id] = characters
-
             # 构建角色名称列表
             char_names = [c["name"] for c in characters]
             name_list = "\n".join(
@@ -768,9 +768,12 @@ class GenshinShowcasePlugin(Star):
             )
 
             # 同时更新别名映射（将当前角色名加入别名映射）
+            global _alias_map, _user_showcase_cache
             for name in char_names:
-                if name not in self.alias_map:
-                    self.alias_map[name] = name
+                if name not in _alias_map:
+                    _alias_map[name] = name
+            # 缓存角色数据到全局变量
+            _user_showcase_cache[user_id] = characters
 
             yield event.plain_result(
                 f"✅ UID {uid} 的展示窗角色列表：\n"
@@ -787,8 +790,10 @@ class GenshinShowcasePlugin(Star):
 
     # ==================== 消息监听 ====================
     # 参考: https://astrbot.app/dev/plugin-minimal 消息事件章节
+    # 使用 staticmethod + module-level 全局变量避免 self 绑定问题
+    @staticmethod
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def on_character_query(self, event: AstrMessageEvent):
+    async def on_character_query(event: AstrMessageEvent):
         """监听纯文本消息，匹配角色名时回复详情卡片。
 
         仅当消息内容完全匹配展示窗返回的角色名称时触发，
@@ -801,7 +806,7 @@ class GenshinShowcasePlugin(Star):
             user_id = event.get_sender_id()
 
             # 检查是否有缓存的展示窗数据
-            if user_id not in self._user_showcase_cache:
+            if user_id not in _user_showcase_cache:
                 return
 
             msg_text = event.message_str.strip()
@@ -809,7 +814,7 @@ class GenshinShowcasePlugin(Star):
                 return
 
             # 获取该用户的角色名集合
-            characters = self._user_showcase_cache[user_id]
+            characters = _user_showcase_cache[user_id]
             char_name_map = {}
             for char in characters:
                 char_name_map[char["name"]] = char
@@ -818,9 +823,9 @@ class GenshinShowcasePlugin(Star):
             matched_char = None
             if msg_text in char_name_map:
                 matched_char = char_name_map[msg_text]
-            elif msg_text in self.alias_map:
+            elif msg_text in _alias_map:
                 # 通过别名映射查找标准名
-                standard_name = self.alias_map[msg_text]
+                standard_name = _alias_map[msg_text]
                 if standard_name in char_name_map:
                     matched_char = char_name_map[standard_name]
 
