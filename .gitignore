@@ -20,5 +20,17 @@ Thumbs.db
 data/
 
 # 测试产物
+_test_*.png
 test_card_output.png
 test_plugin.py
+
+# Enka API 样本数据
+.fetch/
+
+# 图标缓存（运行时自动下载）
+assets/icons/
+assets/char_icons/*.png
+
+# 字体（体积大，手动放置）
+assets/*.ttc
+assets/*.otf

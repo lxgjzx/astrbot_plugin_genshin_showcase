@@ -25,11 +25,11 @@ from pathlib import Path
 from pathlib import PurePosixPath
 
 import aiohttp
-from astrbot.api.event import AstrMessageEvent
+from astrbot.api import star
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.api.all import *
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
 # ======================== 区域配置 ========================
@@ -38,9 +38,23 @@ ASSETS_DIR = PLUGIN_DIR / "assets"
 DATA_DIR = PLUGIN_DIR / "data"
 UID_FILE = DATA_DIR / "genshin_showcase_uid.json"
 ALIAS_FILE = ASSETS_DIR / "alias_map.json"
-FONT_FILE = ASSETS_DIR / "SourceHanSansSC-Regular.otf"
+FONT_FILES = [
+    ASSETS_DIR / "SourceHanSansSC-Regular.otf",
+    ASSETS_DIR / "msyh.ttc",
+    ASSETS_DIR / "SourceHanSansCN-Regular.otf",
+]
+ITEM_NAMES_FILE = ASSETS_DIR / "item_names.json"
+ICON_CACHE_DIR = ASSETS_DIR / "icons"
+
+# 模块级全局状态（避免 self 绑定问题）
+_user_showcase_cache: dict[str, dict] = {}
+_alias_map: dict[str, str] = {}
+_item_names: dict[str, str] = {}  # hash -> 中文名
+_avatar_icons: dict[str, str] = {}  # avatarId -> UI图标名
+_avatar_names: dict[str, str] = {}  # avatarId -> 中文名
 
 ENKA_API_BASE = "https://enka.network/api/uid/{uid}"
+ENKA_CDN_BASE = "https://enka.network/ui/{icon}.png"
 CACHE_TTL = 300  # 5分钟内存缓存（遵守Enka速率限制）
 REQUEST_TIMEOUT = 10  # aiohttp请求超时(秒)
 REQUEST_INTERVAL = 3  # 请求最小间隔(秒)
@@ -49,6 +63,52 @@ REQUEST_INTERVAL = 3  # 请求最小间隔(秒)
 # 内存缓存结构: { uid: {"data": {...}, "timestamp": float} }
 _uid_cache: dict[str, dict] = {}
 _last_request_time: float = 0.0
+
+# 元素代码 -> 中文名/主题色（Enka playerInfo.showAvatarInfoList[].energyType）
+ENERGY_TYPE_MAP = {1: "火", 2: "水", 3: "草", 4: "雷", 5: "冰", 7: "风", 8: "岩"}
+ELEMENT_COLORS = {
+    "火": (255, 122, 61),
+    "水": (61, 145, 255),
+    "草": (113, 201, 71),
+    "雷": (173, 121, 255),
+    "冰": (116, 201, 255),
+    "风": (74, 205, 172),
+    "岩": (233, 190, 84),
+    "物理": (200, 200, 200),
+}
+
+# fightPropMap 主属性ID -> 中文名（圣遗物主/副词条）
+FIGHT_PROP_LABELS = {
+    "FIGHT_PROP_HP": "生命值",
+    "FIGHT_PROP_HP_PERCENT": "生命值%",
+    "FIGHT_PROP_ATTACK": "攻击力",
+    "FIGHT_PROP_ATTACK_PERCENT": "攻击力%",
+    "FIGHT_PROP_DEFENSE": "防御力",
+    "FIGHT_PROP_DEFENSE_PERCENT": "防御力%",
+    "FIGHT_PROP_CRITICAL": "暴击率",
+    "FIGHT_PROP_CRITICAL_HURT": "暴击伤害",
+    "FIGHT_PROP_CHARGE_EFFICIENCY": "元素充能效率",
+    "FIGHT_PROP_ELEMENT_MASTERY": "元素精通",
+    "FIGHT_PROP_HEAL_ADD": "治疗加成",
+    "FIGHT_PROP_PHYSICAL_ADD_HURT": "物理伤害加成",
+    "FIGHT_PROP_FIRE_ADD_HURT": "火元素伤害加成",
+    "FIGHT_PROP_ELEC_ADD_HURT": "雷元素伤害加成",
+    "FIGHT_PROP_WATER_ADD_HURT": "水元素伤害加成",
+    "FIGHT_PROP_GRASS_ADD_HURT": "草元素伤害加成",
+    "FIGHT_PROP_WIND_ADD_HURT": "风元素伤害加成",
+    "FIGHT_PROP_ICE_ADD_HURT": "冰元素伤害加成",
+    "FIGHT_PROP_ROCK_ADD_HURT": "岩元素伤害加成",
+    "FIGHT_PROP_BASE_ATTACK": "基础攻击力",
+}
+
+# 圣遗物部位
+EQUIP_SLOT_NAMES = {
+    "EQUIP_BRACER": "生之花",
+    "EQUIP_NECKLACE": "死之羽",
+    "EQUIP_SHOES": "时之沙",
+    "EQUIP_RING": "空之杯",
+    "EQUIP_DRESS": "理之冠",
+}
 
 
 # ======================== 区域工具函数 ========================
@@ -72,6 +132,63 @@ def load_alias_map() -> dict:
     except Exception as e:
         logger.warning(f"别名映射加载失败: {e}，使用空映射")
         return {}
+
+
+def load_item_names() -> None:
+    """加载精简游戏数据资产（hash->中文名 / avatarId->图标名）。"""
+    global _item_names, _avatar_icons, _avatar_names
+    try:
+        with open(ITEM_NAMES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _item_names = data.get("names", {})
+        _avatar_icons = data.get("avatar_icons", {})
+        _avatar_names = data.get("avatar_names", {})
+        logger.info(
+            f"物品名称数据加载成功: names={len(_item_names)}, "
+            f"icons={len(_avatar_icons)}"
+        )
+    except Exception as e:
+        logger.warning(f"物品名称数据加载失败: {e}")
+
+
+def _resolve_name(hash_val) -> str:
+    """将TextMap hash解析为中文名，失败返回空串。"""
+    if hash_val is None:
+        return ""
+    h = str(hash_val)
+    return _item_names.get(h, "")
+
+
+def _format_stat(prop_id: str, value: float) -> str:
+    """格式化战斗属性值。
+
+    Args:
+        prop_id: fightProp ID（如 FIGHT_PROP_HP / FIGHT_PROP_CRITICAL）。
+        value: 原始数值。
+
+    Returns:
+        str: 格式化后的显示字符串。
+    """
+    if prop_id in (
+        "FIGHT_PROP_HP_PERCENT",
+        "FIGHT_PROP_ATTACK_PERCENT",
+        "FIGHT_PROP_DEFENSE_PERCENT",
+        "FIGHT_PROP_CRITICAL",
+        "FIGHT_PROP_CRITICAL_HURT",
+        "FIGHT_PROP_CHARGE_EFFICIENCY",
+        "FIGHT_PROP_HEAL_ADD",
+        "FIGHT_PROP_PHYSICAL_ADD_HURT",
+        "FIGHT_PROP_FIRE_ADD_HURT",
+        "FIGHT_PROP_ELEC_ADD_HURT",
+        "FIGHT_PROP_WATER_ADD_HURT",
+        "FIGHT_PROP_GRASS_ADD_HURT",
+        "FIGHT_PROP_WIND_ADD_HURT",
+        "FIGHT_PROP_ICE_ADD_HURT",
+        "FIGHT_PROP_ROCK_ADD_HURT",
+    ):
+        # 百分比属性（Enka v2 statValue 本身即百分数值，如 10.9 = 10.9%）
+        return f"{value:.1f}%"
+    return f"{int(round(value))}"
 
 
 def load_uid_bindings() -> dict:
@@ -185,48 +302,52 @@ async def fetch_enka_data(uid: str) -> dict | None:
 
 
 def extract_showcase_characters(data: dict) -> list[dict]:
-    """从Enka API返回数据中提取展示窗角色列表。
+    """从Enka API返回数据中提取展示窗角色列表（保留完整原始数据）。
 
     Args:
         data: Enka API返回的原始JSON。
 
     Returns:
-        list[dict]: 每个元素包含角色基本信息。
+        list[dict]: 每个元素包含角色完整信息（含 raw 原始数据）。
     """
     characters = []
     try:
-        # Enka API v2 结构: data.avatarInfoList
         avatar_info_list = data.get("avatarInfoList", [])
         if not avatar_info_list:
             return characters
 
-        # 构建角色ID到名称的映射（从playerInfo或locale）
-        name_map = {}
-        # 尝试从propMap获取角色名称
-        prop_map = data.get("propMap", {})
         player_info = data.get("playerInfo", {})
+        # 从展示列表构建 avatarId -> 元素代码 映射
+        element_map = {}
+        for show in player_info.get("showAvatarInfoList", []):
+            aid = str(show.get("avatarId", ""))
+            if aid:
+                element_map[aid] = ENERGY_TYPE_MAP.get(
+                    show.get("energyType", 0), ""
+                )
 
         for avatar_info in avatar_info_list:
-            avatar_id = str(
-                avatar_info.get("avatarId", avatar_info.get("avatar_id", ""))
-            )
+            avatar_id = str(avatar_info.get("avatarId", ""))
             if not avatar_id:
                 continue
 
-            # 构建角色数据
             char_data = {
                 "avatar_id": avatar_id,
                 "name": _get_character_name(avatar_info, avatar_id),
-                "level": avatar_info.get("propMap", {}).get(
-                    "4001", {}
-                ).get("val", "?"),
-                "fetter": avatar_info.get(
-                    "fetterInfo", {}
-                ).get("expLevel", 0),
+                "element": element_map.get(avatar_id, ""),
+                "level": avatar_info.get("propMap", {}).get("4001", {}).get(
+                    "val", "?"
+                ),
+                "fetter": avatar_info.get("fetterInfo", {}).get("expLevel", 0),
+                "constellation": _extract_constellation(avatar_info),
                 "talents": _extract_talents(avatar_info),
                 "weapon": _extract_weapon(avatar_info),
                 "reliquaries": _extract_reliquaries(avatar_info),
+                "stats": _extract_stats(
+                    avatar_info, element_map.get(avatar_id, "")
+                ),
                 "costume_id": avatar_info.get("costumeId", None),
+                "raw": avatar_info,  # 保留原始数据供卡片渲染
             }
             characters.append(char_data)
     except Exception as e:
@@ -334,18 +455,33 @@ _CN_NAME_MAP = {
 
 def _get_character_name(avatar_info: dict, avatar_id: str) -> str:
     """从Enka API数据中获取角色中文名称。"""
-    # 优先使用本地化名称
-    name_map = avatar_info.get("nameMap", {})
-    if name_map:
-        # 优先中文简体
-        for key in ["2", "3", "4", "hash_1906669899"]:  # 2=zh-cn
-            if key in name_map:
-                return name_map[key]
-        if name_map:
-            return next(iter(name_map.values()))
+    # 1. 优先资产中的角色名映射（覆盖最新版本）
+    if avatar_id in _avatar_names:
+        return _avatar_names[avatar_id]
 
-    # 回退到内置映射
+    # 2. 使用内置映射
     return _CN_NAME_MAP.get(avatar_id, f"未知角色({avatar_id})")
+
+
+def _extract_constellation(avatar_info: dict) -> int:
+    """提取命座数量。
+
+    Enka API v2 中命座信息存储在 propMap["1002"].ival，
+    而非 talentIdList（该字段在 v2 常为 null）。
+
+    Args:
+        avatar_info: Enka API 角色原始数据。
+
+    Returns:
+        int: 命座数（0-6）。
+    """
+    try:
+        prop = avatar_info.get("propMap", {}).get("1002", {})
+        val = prop.get("ival", prop.get("val", 0))
+        return int(val or 0)
+    except (ValueError, TypeError):
+        # 回退：talentIdList 长度
+        return len(avatar_info.get("talentIdList", []) or [])
 
 
 def _extract_talents(avatar_info: dict) -> dict:
@@ -376,194 +512,562 @@ def _extract_talents(avatar_info: dict) -> dict:
 
 
 def _extract_weapon(avatar_info: dict) -> dict:
-    """提取武器信息。
+    """提取武器完整信息。
 
     Returns:
-        dict: { "name": str, "refine": int, "level": int }
+        dict: { "name", "icon", "rarity", "level", "refine",
+                "base_atk", "sub_stat_name", "sub_stat_value" }
     """
     try:
         equip_list = avatar_info.get("equipList", [])
         for equip in equip_list:
-            weapon_data = equip.get("weapon", equip.get("flat", {}).get("weaponStats"))
-            if weapon_data or equip.get("weapon"):
-                w = equip.get("weapon", {})
-                name = (
-                    equip.get("flat", {})
-                    .get("nameTextMapHash", {})
-                    if isinstance(equip.get("flat", {}).get("nameTextMapHash"), dict)
-                    else None
+            if "weapon" not in equip:
+                continue
+            w = equip.get("weapon", {})
+            flat = equip.get("flat", {})
+            weapon_stats = flat.get("weaponStats", [])
+
+            # 副属性：武器副属性（第二个属性）
+            sub_name = ""
+            sub_value = ""
+            if len(weapon_stats) > 1:
+                sub_name = FIGHT_PROP_LABELS.get(
+                    weapon_stats[1].get("appendPropId", ""), ""
                 )
-                # 从flat中尝试获取武器名称
-                flat_name = equip.get("flat", {}).get("weaponStats", [])
-                weapon_name = ""
-                # 尝试从icon获取
-                icon = equip.get("flat", {}).get("icon", "")
-                if icon:
-                    weapon_name = icon.replace("UI_EquipIcon_", "").split("_")[
-                        0
-                    ] if "_" in icon else icon
+                sub_value = _format_stat(
+                    weapon_stats[1].get("appendPropId", ""),
+                    weapon_stats[1].get("statValue", 0),
+                )
 
-                affix = w.get("affix", 0)
-                refine = affix + 1 if affix else 1
+            # 精炼等级
+            affix_map = w.get("affixMap", {})
+            refine = 1
+            if affix_map:
+                refine = max(affix_map.values()) + 1
 
-                return {
-                    "name": weapon_name or "未知武器",
-                    "refine": refine,
-                    "level": w.get("level", 0),
-                }
+            return {
+                "name": _resolve_name(flat.get("nameTextMapHash", ""))
+                or "未知武器",
+                "icon": flat.get("icon", ""),
+                "rarity": flat.get("rarity", 5),
+                "level": w.get("level", 0),
+                "promote_level": w.get("promoteLevel", 0),
+                "refine": refine,
+                "base_atk": int(
+                    round(weapon_stats[0].get("statValue", 0))
+                    if weapon_stats
+                    else 0
+                ),
+                "sub_stat_name": sub_name,
+                "sub_stat_value": sub_value,
+            }
     except Exception as e:
         logger.debug(f"武器提取失败: {e}")
-    return {"name": "未知", "refine": 1, "level": 0}
+    return {
+        "name": "未知武器",
+        "icon": "",
+        "rarity": 5,
+        "level": 0,
+        "promote_level": 0,
+        "refine": 1,
+        "base_atk": 0,
+        "sub_stat_name": "",
+        "sub_stat_value": "",
+    }
 
 
 def _extract_reliquaries(avatar_info: dict) -> list[dict]:
-    """提取圣遗物信息。
+    """提取圣遗物完整信息（含主/副词条）。
 
     Returns:
-        list[dict]: 每个元素包含套装和主词条信息。
+        list[dict]: 每个元素包含图标、名称、套装、等级、主/副词条。
     """
     reliquaries = []
     try:
         equip_list = avatar_info.get("equipList", [])
         for equip in equip_list:
-            if "reliquary" in equip:
-                r = equip["reliquary"]
-                main_prop = r.get("mainPropId", "")
+            if "reliquary" not in equip:
+                continue
+            r = equip.get("reliquary", {})
+            flat = equip.get("flat", {})
 
-                reliquaries.append(
-                    {
-                        "name": equip.get("flat", {}).get("setNameTextMapHash", ""),
-                        "main_stat": str(main_prop),
-                    }
-                )
+            main = flat.get("reliquaryMainstat", {})
+            substats = [
+                {
+                    "name": FIGHT_PROP_LABELS.get(
+                        s.get("appendPropId", ""), s.get("appendPropId", "")
+                    ),
+                    "value": _format_stat(
+                        s.get("appendPropId", ""),
+                        s.get("statValue", 0),
+                    ),
+                }
+                for s in flat.get("reliquarySubstats", [])
+            ]
+
+            reliquaries.append(
+                {
+                    "icon": flat.get("icon", ""),
+                    "name": _resolve_name(flat.get("nameTextMapHash", ""))
+                    or EQUIP_SLOT_NAMES.get(flat.get("equipType", ""), ""),
+                    "set_name": _resolve_name(flat.get("setNameTextMapHash", "")),
+                    "set_id": _extract_set_id(flat.get("icon", "")),
+                    "rarity": flat.get("rarity", 5),
+                    "level": r.get("level", 0),
+                    "equip_type": flat.get("equipType", ""),
+                    "main_stat_name": FIGHT_PROP_LABELS.get(
+                        main.get("mainPropId", ""), main.get("mainPropId", "")
+                    ),
+                    "main_stat_value": _format_stat(
+                        main.get("mainPropId", ""),
+                        main.get("statValue", 0),
+                    ),
+                    "substats": substats,
+                }
+            )
     except Exception as e:
         logger.debug(f"圣遗物提取失败: {e}")
     return reliquaries
 
 
+def _extract_set_id(icon: str) -> str:
+    """从圣遗物图标名提取套装ID，如 UI_RelicIcon_15021_4 -> 15021。"""
+    try:
+        return icon.replace("UI_RelicIcon_", "").split("_")[0]
+    except Exception:
+        return ""
+
+
+def _extract_stats(avatar_info: dict, element: str = "") -> dict:
+    """提取角色战斗属性。
+
+    从 fightPropMap 提取基础值/总值；元素精通从圣遗物词条累加
+    （Enka API 的 fightPropMap 不包含精通）。
+
+    Args:
+        avatar_info: Enka API 角色原始数据。
+        element: 角色元素中文名（由展示列表 energyType 映射）。
+
+    Returns:
+        dict: { "hp", "atk", "def", "em", "crit_rate", "crit_dmg",
+                "er", "dmg_bonus", "dmg_bonus_label" }
+    """
+    fpm = avatar_info.get("fightPropMap", {}) or {}
+    base_hp = fpm.get("1", 0)
+    base_atk = fpm.get("4", 0)
+    base_def = fpm.get("7", 0)
+    total_hp = fpm.get("2000", base_hp)
+    total_atk = fpm.get("2001", base_atk)
+    total_def = fpm.get("2002", base_def)
+
+    # 元素伤害加成：按角色元素映射 prop ID
+    dmg_prop_map = {
+        "火": "40",
+        "雷": "41",
+        "水": "42",
+        "草": "43",
+        "风": "44",
+        "岩": "45",
+        "冰": "46",
+    }
+    dmg_prop = dmg_prop_map.get(element, "")
+    dmg_bonus = fpm.get(dmg_prop, 0) if dmg_prop else 0
+
+    # 元素精通：从圣遗物主/副词条原始 statValue 累加
+    em = 0
+    for equip in avatar_info.get("equipList", []):
+        if "reliquary" not in equip:
+            continue
+        flat = equip.get("flat", {})
+        main = flat.get("reliquaryMainstat", {})
+        if main.get("mainPropId") == "FIGHT_PROP_ELEMENT_MASTERY":
+            em += int(main.get("statValue", 0))
+        for sub in flat.get("reliquarySubstats", []):
+            if sub.get("appendPropId") == "FIGHT_PROP_ELEMENT_MASTERY":
+                em += int(sub.get("statValue", 0))
+
+    return {
+        "hp": {"base": int(round(base_hp)), "total": int(round(total_hp))},
+        "atk": {"base": int(round(base_atk)), "total": int(round(total_atk))},
+        "def": {"base": int(round(base_def)), "total": int(round(total_def))},
+        "em": em,
+        "crit_rate": fpm.get("20", 0),
+        "crit_dmg": fpm.get("22", 0),
+        "er": fpm.get("23", 0),
+        "dmg_bonus": dmg_bonus,
+        "dmg_bonus_label": f"{element}元素伤害加成" if element else "伤害加成",
+    }
+
+
 async def generate_character_card(
     character: dict, avatar_info_from_api: dict | None = None
 ) -> BytesIO | None:
-    """使用Pillow合成角色详情信息卡片。
+    """使用Pillow合成enka.network风格的角色详情卡片。
 
-    左侧放置角色立绘（优先API图标链接，回退本地assets/char_icons/），
-    右侧排版文字信息（武器、圣遗物、天赋）。
+    布局（三栏，参考 enka.network 角色展示卡片）：
+      - 左侧: 角色立绘 + 名称 + 等级 + 命座 + 天赋 + UID
+      - 中间: 武器 + 属性面板 + 圣遗物套装
+      - 右侧: 5个圣遗物卡片（图标、主词条、等级、副词条）
 
     Args:
-        character: 角色数据字典。
-        avatar_info_from_api: 完整API数据（用于获取立绘URL）。
+        character: 角色数据字典（含 raw 原始数据）。
+        avatar_info_from_api: 完整API数据（兼容保留）。
 
     Returns:
         BytesIO | None: 合成图片的字节流，失败返回None。
     """
     try:
-        # 卡片尺寸
-        CARD_W, CARD_H = 800, 400
+        # ---- 尺寸与布局参数 ----
+        CARD_W, CARD_H = 1560, 860
+        MARGIN = 24
+        LEFT_W = 340          # 左侧立绘栏宽
+        MID_W = 430           # 中间信息栏宽
+        GAP = 18              # 栏间距
+        RIGHT_X = MARGIN + LEFT_W + GAP + MID_W + GAP
+        RIGHT_W = CARD_W - MARGIN * 2 - LEFT_W - MID_W - GAP * 2
 
-        # 创建画布
-        card = PILImage.new("RGBA", (CARD_W, CARD_H), (30, 30, 30, 255))
+        # 元素主题色
+        element = character.get("element", "")
+        accent = ELEMENT_COLORS.get(element, (255, 215, 0))
+        bg_top = (24, 26, 32)
+        bg_bottom = (34, 38, 48)
+
+        # 创建画布（垂直渐变背景）
+        card = PILImage.new("RGBA", (CARD_W, CARD_H), bg_top)
+        for y in range(CARD_H):
+            t = y / max(CARD_H - 1, 1)
+            color = tuple(
+                int(bg_top[i] + (bg_bottom[i] - bg_top[i]) * t) for i in range(3)
+            )
+            for x in range(0, CARD_W, 8):
+                card.paste((*color, 255), (x, y, x + 8, y + 1))
         draw = ImageDraw.Draw(card)
 
-        # 加载字体
+        # 字体
+        font_name = _get_font(42)
+        font_name_sub = _get_font(20)
         font_large = _get_font(24)
         font_medium = _get_font(18)
         font_small = _get_font(14)
+        font_tiny = _get_font(12)
 
-        # 面板1: 角色立绘区域 (左侧)
-        art_area = PILImage.new("RGBA", (250, 380), (50, 50, 50, 255))
+        # ==================== 左侧: 角色立绘 ====================
+        art_x, art_y = MARGIN, MARGIN
+        art_w, art_h = LEFT_W, CARD_H - MARGIN * 2
+        # 立绘区域背景
+        _draw_rounded_rect(card, (art_x, art_y, art_x + art_w, art_y + art_h),
+                           radius=16, fill=(20, 22, 28, 255))
+
         char_icon = await _load_character_icon(character["avatar_id"])
         if char_icon:
-            # 缩放以适合区域
+            # 裁剪/缩放为竖版比例
+            ratio = art_h / art_w
+            img_ratio = char_icon.height / max(char_icon.width, 1)
+            if img_ratio > ratio:
+                # 图片更竖: 裁宽
+                new_w = int(char_icon.height / ratio)
+                left = (char_icon.width - new_w) // 2
+                char_icon = char_icon.crop((left, 0, left + new_w, char_icon.height))
+            else:
+                # 图片更横: 裁高
+                new_h = int(char_icon.width * ratio)
+                top = (char_icon.height - new_h) // 2
+                char_icon = char_icon.crop((0, top, char_icon.width, top + new_h))
             char_icon = char_icon.resize(
-                (240, 360), PILImage.Resampling.LANCZOS
+                (art_w, art_h), PILImage.Resampling.LANCZOS
             )
-            art_area.paste(
-                char_icon,
-                (10, 10),
-                char_icon if char_icon.mode == "RGBA" else None,
-            )
-        card.paste(art_area, (10, 10))
+            card.paste(char_icon, (art_x, art_y), char_icon if char_icon.mode == "RGBA" else None)
 
-        # 面板2: 角色信息区域 (右侧)
-        info_x = 280
-        y = 20
+        # 底部渐隐（保证文字可读）
+        overlay = PILImage.new("RGBA", (art_w, art_h), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        for i in range(art_h // 2):
+            alpha = int(200 * (i / max(art_h // 2, 1)) ** 1.5)
+            od.line([(0, art_y + art_h // 2 + i), (art_w, art_y + art_h // 2 + i)],
+                    fill=(0, 0, 0, alpha))
+        card.paste(overlay, (art_x, art_y), overlay)
 
-        # 角色名
-        name_text = f"「{character['name']}」"
-        draw.text((info_x, y), name_text, fill=(255, 215, 0, 255), font=font_large)
-        y += 40
+        # ---- 左侧文字信息 ----
+        # 角色名 + 元素标签
+        name_text = character.get("name", "未知")
+        draw.text((art_x + 18, art_y + 18), name_text, fill=(255, 255, 255, 255),
+                  font=font_name)
+        # 元素徽章
+        if element:
+            badge_w = font_medium.getlength(element) + 24
+            _draw_rounded_rect(card, (art_x + 18, art_y + 74,
+                                      art_x + 18 + badge_w, art_y + 74 + 28),
+                               radius=14, fill=accent)
+            draw.text((art_x + 30, art_y + 76), element,
+                      fill=(20, 22, 28, 255), font=_get_font(16))
 
-        # 等级/好感
-        level_text = f"等级: {character.get('level', '?')}  好感度: {character.get('fetter', 0)}"
-        draw.text((info_x, y), level_text, fill=(200, 200, 200, 255), font=font_medium)
-        y += 35
+        # 等级
+        level = character.get("level", "?")
+        level_text = f"Lv. {level}/90"
+        draw.text((art_x + 18, art_y + 116), level_text,
+                  fill=(200, 200, 210, 255), font=font_large)
 
-        # 分隔线
-        draw.line([(info_x, y), (CARD_W - 20, y)], fill=(100, 100, 100, 255), width=1)
-        y += 10
+        # 命座
+        cons = character.get("constellation", 0)
+        cons_color = accent if cons > 0 else (120, 120, 130, 255)
+        draw.text((art_x + 18, art_y + 152), f"命座 {cons}",
+                  fill=cons_color, font=font_medium)
 
-        # 武器信息
-        weapon = character.get("weapon", {})
-        weapon_text = (
-            f"武器: {weapon.get('name', '未知')}  "
-            f"精炼{weapon.get('refine', 1)}"
-        )
-        draw.text(
-            (info_x, y), weapon_text, fill=(135, 206, 250, 255), font=font_medium
-        )
-        y += 35
-
-        # 天赋信息
+        # 天赋（三个小方块）
         talents = character.get("talents", {})
-        talent_text = (
-            f"天赋: 普攻{talents.get('普攻', '?')} / "
-            f"战技{talents.get('战技', '?')} / "
-            f"爆发{talents.get('爆发', '?')}"
-        )
-        draw.text(
-            (info_x, y), talent_text, fill=(144, 238, 144, 255), font=font_medium
-        )
-        y += 35
+        talent_y = art_y + 196
+        talent_items = [
+            ("普攻", talents.get("普攻", 0)),
+            ("战技", talents.get("战技", 0)),
+            ("爆发", talents.get("爆发", 0)),
+        ]
+        for i, (label, tlv) in enumerate(talent_items):
+            x0 = art_x + 18 + i * 96
+            _draw_rounded_rect(card, (x0, talent_y, x0 + 86, talent_y + 52),
+                               radius=10, fill=(45, 49, 62, 255),
+                               outline=(70, 76, 96, 255), outline_width=1)
+            draw.text((x0 + 8, talent_y + 6), label, fill=(150, 155, 170, 255),
+                      font=font_tiny)
+            draw.text((x0 + 8, talent_y + 24), str(tlv),
+                      fill=(255, 255, 255, 255), font=_get_font(20))
 
-        # 分隔线
-        draw.line([(info_x, y), (CARD_W - 20, y)], fill=(100, 100, 100, 255), width=1)
-        y += 10
+        # UID（底部）
+        uid = _get_uid_for_character(character)
+        if uid:
+            draw.text((art_x + 18, art_y + art_h - 40), f"UID: {uid}",
+                      fill=(160, 165, 180, 255), font=font_medium)
 
-        # 圣遗物信息
+        # ==================== 中间: 武器 + 属性 ====================
+        mid_x = MARGIN + LEFT_W + GAP
+        y = MARGIN
+
+        # ---- 武器卡片 ----
+        weapon = character.get("weapon", {})
+        weapon_h = 150
+        _draw_rounded_rect(card, (mid_x, y, mid_x + MID_W, y + weapon_h),
+                           radius=16, fill=(38, 42, 54, 255))
+        # 武器图标
+        w_icon = await _load_icon(weapon.get("icon", ""), 96)
+        if w_icon:
+            card.paste(w_icon, (mid_x + 16, y + (weapon_h - 96) // 2),
+                       w_icon if w_icon.mode == "RGBA" else None)
+        # 武器名 + 精炼
+        wx = mid_x + 130
+        draw.text((wx, y + 18), weapon.get("name", "未知武器"),
+                  fill=(255, 255, 255, 255), font=font_large)
+        refine = weapon.get("refine", 1)
+        draw.text((wx, y + 52), f"精炼 {refine}  ·  Lv.{weapon.get('level', 0)}",
+                  fill=(180, 185, 200, 255), font=font_small)
+        # 基础攻击 + 副属性
+        draw.text((wx, y + 80), f"基础攻击 {weapon.get('base_atk', 0)}",
+                  fill=(220, 220, 230, 255), font=font_small)
+        sub_text = ""
+        if weapon.get("sub_stat_name") and weapon.get("sub_stat_value"):
+            sub_text = f"{weapon['sub_stat_name']} {weapon['sub_stat_value']}"
+        if sub_text:
+            draw.text((wx, y + 106), sub_text, fill=(160, 165, 180, 255),
+                      font=font_small)
+        y += weapon_h + 16
+
+        # ---- 属性面板 ----
+        stats = character.get("stats", {})
+        stat_rows = _build_stat_rows(stats)
+        panel_h = 30 + len(stat_rows) * 44 + 10
+        _draw_rounded_rect(card, (mid_x, y, mid_x + MID_W, y + panel_h),
+                           radius=16, fill=(38, 42, 54, 255))
+        draw.text((mid_x + 16, y + 12), "属性", fill=(140, 146, 165, 255),
+                  font=_get_font(16))
+        sy = y + 44
+        for label, main_val, sub_val, color in stat_rows:
+            draw.text((mid_x + 16, sy), label, fill=(170, 175, 190, 255),
+                      font=font_medium)
+            # 主值
+            draw.text((mid_x + MID_W - 16 - font_medium.getlength(main_val), sy),
+                      main_val, fill=color, font=font_medium)
+            # 副值（白字+绿字）
+            if sub_val:
+                draw.text((mid_x + 16, sy + 22), sub_val,
+                          fill=(110, 115, 130, 255), font=font_tiny)
+            sy += 44
+        y += panel_h + 16
+
+        # ---- 圣遗物套装 ----
+        set_info = _build_set_info(character.get("reliquaries", []))
+        set_h = 66
+        _draw_rounded_rect(card, (mid_x, y, mid_x + MID_W, y + set_h),
+                           radius=16, fill=(38, 42, 54, 255))
+        if set_info:
+            draw.text((mid_x + 16, y + 12), set_info["name"],
+                      fill=(255, 255, 255, 255), font=font_large)
+            draw.text((mid_x + 16, y + 46), f"{set_info['count']} 件套",
+                      fill=accent, font=font_medium)
+        else:
+            draw.text((mid_x + 16, y + 20), "圣遗物套装: 未知",
+                      fill=(160, 165, 180, 255), font=font_medium)
+
+        # ==================== 右侧: 圣遗物列表 ====================
         reliquaries = character.get("reliquaries", [])
         if reliquaries:
-            draw.text(
-                (info_x, y), "圣遗物:", fill=(255, 182, 193, 255), font=font_medium
-            )
-            y += 30
-            for r in reliquaries[:5]:  # 最多显示5件
-                r_text = f"  • {r.get('name', '未知')} ({r.get('main_stat', '?')})"
-                draw.text(
-                    (info_x, y),
-                    r_text,
-                    fill=(180, 180, 180, 255),
-                    font=font_small,
+            # 预取所有圣遗物图标（异步下载到本地缓存，供 _draw_reliquary_card 同步读取）
+            for rel in reliquaries:
+                await _load_icon(rel.get("icon", ""), 72)
+            slot_h = (CARD_H - MARGIN * 2 - (len(reliquaries) - 1) * 12) // len(reliquaries)
+            for i, rel in enumerate(reliquaries):
+                ry = MARGIN + i * (slot_h + 12)
+                _draw_reliquary_card(
+                    card, (RIGHT_X, ry, RIGHT_X + RIGHT_W, ry + slot_h),
+                    rel, font_large, font_medium, font_small, font_tiny,
+                    accent, draw,
                 )
-                y += 22
-        else:
-            draw.text(
-                (info_x, y),
-                "圣遗物: 无数据",
-                fill=(180, 180, 180, 255),
-                font=font_medium,
-            )
 
         # 保存为BytesIO
         output = BytesIO()
-        final_rgb = PILImage.new("RGB", card.size, (30, 30, 30))
+        final_rgb = PILImage.new("RGB", card.size, (24, 26, 32))
         final_rgb.paste(card, mask=card.split()[3])
         final_rgb.save(output, format="PNG", optimize=True)
         output.seek(0)
         return output
 
     except Exception as e:
-        logger.error(f"合成角色卡片失败: {e}")
+        logger.error(f"合成角色卡片失败: {e}", exc_info=True)
         return None
+
+
+def _build_stat_rows(stats: dict) -> list[tuple]:
+    """构建属性面板显示行。
+
+    Returns:
+        list[tuple]: (标签, 主值, 副值, 颜色)
+    """
+    rows = []
+
+    def hp_atk_def(label, key):
+        s = stats.get(key, {})
+        total = s.get("total", 0)
+        base = s.get("base", 0)
+        bonus = total - base
+        color = (255, 255, 255, 255) if bonus > 0 else (200, 205, 220, 255)
+        sub = f"基础 {base}  +{bonus}" if bonus > 0 else f"基础 {base}"
+        return (label, str(total), sub, color)
+
+    rows.append(hp_atk_def("生命值", "hp"))
+    rows.append(hp_atk_def("攻击力", "atk"))
+    rows.append(hp_atk_def("防御力", "def"))
+    rows.append(("元素精通", str(stats.get("em", 0)), "", (200, 205, 220, 255)))
+    rows.append((
+        "暴击率",
+        f"{stats.get('crit_rate', 0) * 100:.1f}%",
+        "",
+        (255, 255, 255, 255),
+    ))
+    rows.append((
+        "暴击伤害",
+        f"{stats.get('crit_dmg', 0) * 100:.1f}%",
+        "",
+        (255, 255, 255, 255),
+    ))
+    rows.append((
+        "元素充能效率",
+        f"{stats.get('er', 0) * 100:.1f}%",
+        "",
+        (255, 255, 255, 255),
+    ))
+    rows.append((
+        stats.get("dmg_bonus_label", "伤害加成"),
+        f"{stats.get('dmg_bonus', 0) * 100:.1f}%",
+        "",
+        (255, 255, 255, 255),
+    ))
+    return rows
+
+
+def _build_set_info(reliquaries: list[dict]) -> dict | None:
+    """统计圣遗物套装信息（返回件数最多的套装）。"""
+    from collections import Counter
+
+    counter = Counter()
+    for rel in reliquaries:
+        if rel.get("set_name"):
+            counter[rel["set_name"]] += 1
+    if not counter:
+        return None
+    name, count = counter.most_common(1)[0]
+    return {"name": name, "count": count}
+
+
+def _draw_reliquary_card(
+    card: PILImage.Image,
+    box: tuple,
+    rel: dict,
+    font_large,
+    font_medium,
+    font_small,
+    font_tiny,
+    accent,
+    draw,
+) -> None:
+    """绘制单个圣遗物卡片（右侧列表项）。"""
+    x0, y0, x1, y1 = box
+    _draw_rounded_rect(card, box, radius=12, fill=(38, 42, 54, 255))
+
+    # 图标
+    icon = _load_icon_sync(rel.get("icon", ""), 72)
+    if icon:
+        card.paste(icon, (x0 + 12, y0 + (y1 - y0 - 72) // 2),
+                   icon if icon.mode == "RGBA" else None)
+
+    ix = x0 + 100
+    # 主词条（大字）+ 部位/星级
+    main_name = rel.get("main_stat_name", "")
+    main_val = rel.get("main_stat_value", "")
+    draw.text((ix, y0 + 12), f"{main_name} {main_val}",
+              fill=(255, 255, 255, 255), font=font_large)
+    slot = EQUIP_SLOT_NAMES.get(rel.get("equip_type", ""), "")
+    rarity = rel.get("rarity", 5)
+    draw.text((ix, y0 + 48), f"{slot}  +{rel.get('level', 0)}  "
+                             f"{'★' * rarity}",
+              fill=accent, font=font_small)
+
+    # 副词条（2x2 网格）
+    subs = rel.get("substats", [])
+    grid_x0 = ix
+    grid_y0 = y0 + 74
+    col_w = (x1 - grid_x0 - 12) // 2
+    for i, sub in enumerate(subs[:4]):
+        sx = grid_x0 + (i % 2) * col_w
+        sy = grid_y0 + (i // 2) * 22
+        draw.text((sx, sy), sub.get("name", ""), fill=(120, 125, 140, 255),
+                  font=font_tiny)
+        val_w = font_tiny.getlength(sub.get("value", ""))
+        draw.text((sx + col_w - 60 - val_w, sy), sub.get("value", ""),
+                  fill=(200, 205, 220, 255), font=font_tiny)
+
+
+def _draw_rounded_rect(
+    img: PILImage.Image,
+    box: tuple,
+    radius: int,
+    fill: tuple,
+    outline: tuple | None = None,
+    outline_width: int = 1,
+) -> None:
+    """绘制圆角矩形。"""
+    overlay = PILImage.new("RGBA", img.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    od.rounded_rectangle(box, radius=radius, fill=fill, outline=outline,
+                         width=outline_width)
+    img.paste(overlay, (0, 0), overlay)
+
+
+def _get_uid_for_character(character: dict) -> str:
+    """获取角色所属的UID（从全局缓存中反查）。"""
+    for uid_data in _user_showcase_cache.values():
+        if not isinstance(uid_data, dict):
+            continue  # 兼容旧版缓存结构（list）
+        for c in uid_data.get("characters", []):
+            if c.get("avatar_id") == character.get("avatar_id"):
+                return uid_data.get("uid", "")
+    return ""
 
 
 def _get_font(size: int) -> ImageFont.FreeTypeFont:
@@ -578,8 +1082,9 @@ def _get_font(size: int) -> ImageFont.FreeTypeFont:
         ImageFont.FreeTypeFont
     """
     try:
-        if FONT_FILE.exists():
-            return ImageFont.truetype(str(FONT_FILE), size)
+        for font_file in FONT_FILES:
+            if font_file.exists():
+                return ImageFont.truetype(str(font_file), size)
     except Exception:
         pass
 
@@ -623,9 +1128,15 @@ async def _load_character_icon(avatar_id: str) -> PILImage.Image | None:
         except Exception as e:
             logger.debug(f"加载本地图标失败: {local_path}, {e}")
 
-    # 2. 尝试从CDN下载
-    # Enka CDN: https://enka.network/ui/UI_AvatarIcon_{id}.png
-    cdn_url = f"https://enka.network/ui/UI_AvatarIcon_{avatar_id}.png"
+    # 2. 尝试从CDN下载（需用图标名而非角色ID）
+    icon_name = _avatar_icons.get(avatar_id, "")
+    cdn_url = ""
+    if icon_name:
+        cdn_url = ENKA_CDN_BASE.format(icon=icon_name)
+    else:
+        # 回退：尝试旧式ID URL
+        cdn_url = f"https://enka.network/ui/UI_AvatarIcon_{avatar_id}.png"
+
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -645,6 +1156,62 @@ async def _load_character_icon(avatar_id: str) -> PILImage.Image | None:
     return placeholder
 
 
+async def _load_icon(icon_name: str, size: int) -> PILImage.Image | None:
+    """加载通用图标（武器/圣遗物），带本地缓存。
+
+    Args:
+        icon_name: Enka CDN图标名（如 UI_EquipIcon_Claymore_Kione）。
+        size: 目标尺寸（正方形）。
+
+    Returns:
+        PILImage.Image | None
+    """
+    if not icon_name:
+        return None
+    icon = _load_icon_sync(icon_name, size)
+    if icon is not None:
+        return icon
+
+    # 异步下载并缓存
+    try:
+        cdn_url = ENKA_CDN_BASE.format(icon=icon_name)
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(cdn_url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    img = PILImage.open(BytesIO(data)).convert("RGBA")
+                    # 缓存
+                    ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    (ICON_CACHE_DIR / f"{icon_name}.png").write_bytes(data)
+                    return img.resize((size, size), PILImage.Resampling.LANCZOS)
+    except Exception as e:
+        logger.debug(f"下载图标失败 {icon_name}: {e}")
+    return None
+
+
+def _load_icon_sync(icon_name: str, size: int) -> PILImage.Image | None:
+    """同步加载本地缓存的图标（无缓存则返回None）。
+
+    Args:
+        icon_name: Enka CDN图标名。
+        size: 目标尺寸（正方形）。
+
+    Returns:
+        PILImage.Image | None
+    """
+    if not icon_name:
+        return None
+    cache_path = ICON_CACHE_DIR / f"{icon_name}.png"
+    if cache_path.exists():
+        try:
+            img = PILImage.open(cache_path).convert("RGBA")
+            return img.resize((size, size), PILImage.Resampling.LANCZOS)
+        except Exception:
+            pass
+    return None
+
+
 # ======================== 区域插件注册 ========================
 # 参考: https://astrbot.app/dev/plugin-minimal
 @register("genshin_showcase", "astrbot", "原神角色展示窗插件", "1.0.0")
@@ -660,13 +1227,13 @@ class GenshinShowcasePlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        self.alias_map = load_alias_map()
-        # 内存中缓存最近一次查询的角色数据 { user_id_str: [character_dict, ...] }
-        self._user_showcase_cache: dict[str, list[dict]] = {}
+        global _alias_map
+        _alias_map = load_alias_map()
+        load_item_names()
 
     # ==================== 指令处理 ====================
     # 参考: https://astrbot.app/dev/plugin-minimal 指令注册章节
-    @on_command("bind_uid")
+    @filter.command("bind_uid")
     async def bind_uid(self, event: AstrMessageEvent):
         """绑定UID指令处理。
 
@@ -678,7 +1245,7 @@ class GenshinShowcasePlugin(Star):
         try:
             args = event.message_str.strip().split()
             if len(args) < 2:
-                yield event.plain_message(
+                yield event.plain_result(
                     "❌ 用法: /bind_uid <原神UID>\n"
                     "示例: /bind_uid 123456789"
                 )
@@ -687,7 +1254,7 @@ class GenshinShowcasePlugin(Star):
             uid = args[1].strip()
 
             if not validate_uid(uid):
-                yield event.plain_message(
+                yield event.plain_result(
                     "❌ UID格式错误！UID应为9-10位纯数字。\n"
                     f"你输入的是: {uid} (长度{len(uid)})"
                 )
@@ -700,7 +1267,7 @@ class GenshinShowcasePlugin(Star):
             save_uid_bindings(bindings)
 
             logger.info(f"UID绑定成功: user={user_id}, uid={uid}")
-            yield event.plain_message(
+            yield event.plain_result(
                 f"✅ UID绑定成功！\n"
                 f"玩家ID: {user_id}\n"
                 f"原神UID: {uid}\n\n"
@@ -709,9 +1276,9 @@ class GenshinShowcasePlugin(Star):
 
         except Exception as e:
             logger.error(f"bind_uid指令异常: {e}")
-            yield event.plain_message("❌ 绑定过程中发生错误，请稍后重试。")
+            yield event.plain_result("❌ 绑定过程中发生错误，请稍后重试。")
 
-    @on_command("my_showcase")
+    @filter.command("my_showcase")
     async def my_showcase(self, event: AstrMessageEvent):
         """查询展示窗指令处理。
 
@@ -726,7 +1293,7 @@ class GenshinShowcasePlugin(Star):
             bindings = load_uid_bindings()
 
             if user_id not in bindings:
-                yield event.plain_message(
+                yield event.plain_result(
                     "❌ 你还未绑定原神UID！\n"
                     "请使用 /bind_uid <UID> 先绑定你的UID。\n"
                     "示例: /bind_uid 123456789"
@@ -734,16 +1301,13 @@ class GenshinShowcasePlugin(Star):
                 return
 
             uid = bindings[user_id]
-            # 提示用户正在查询
-            await event.send(
-                event.plain_message(
-                    f"⏳ 正在查询 UID {uid} 的展示窗数据..."
-                )
+            yield event.plain_result(
+                f"⏳ 正在查询 UID {uid} 的展示窗数据..."
             )
 
             data = await fetch_enka_data(uid)
             if data is None:
-                yield event.plain_message(
+                yield event.plain_result(
                     "❌ 查询失败！可能原因：\n"
                     "1. UID不正确或不存在\n"
                     "2. Enka.Network 服务暂时不可用\n"
@@ -755,14 +1319,11 @@ class GenshinShowcasePlugin(Star):
 
             characters = extract_showcase_characters(data)
             if not characters:
-                yield event.plain_message(
+                yield event.plain_result(
                     "⚠️ 获取到展示窗数据，但未发现角色信息。\n"
                     "请确认你的原神展示窗中有角色展示。"
                 )
                 return
-
-            # 缓存角色数据供后续匹配
-            self._user_showcase_cache[user_id] = characters
 
             # 构建角色名称列表
             char_names = [c["name"] for c in characters]
@@ -771,11 +1332,21 @@ class GenshinShowcasePlugin(Star):
             )
 
             # 同时更新别名映射（将当前角色名加入别名映射）
+            global _alias_map, _user_showcase_cache
             for name in char_names:
-                if name not in self.alias_map:
-                    self.alias_map[name] = name
+                if name not in _alias_map:
+                    _alias_map[name] = name
+            # 缓存角色数据到全局变量（含UID与玩家信息）
+            player_info = data.get("playerInfo", {})
+            _user_showcase_cache[user_id] = {
+                "uid": uid,
+                "nickname": player_info.get("nickname", ""),
+                "player_level": player_info.get("level", ""),
+                "characters": characters,
+                "timestamp": time.time(),
+            }
 
-            yield event.plain_message(
+            yield event.plain_result(
                 f"✅ UID {uid} 的展示窗角色列表：\n"
                 f"{name_list}\n\n"
                 f"共 {len(char_names)} 个角色。\n"
@@ -784,13 +1355,16 @@ class GenshinShowcasePlugin(Star):
 
         except Exception as e:
             logger.error(f"my_showcase指令异常: {e}")
-            yield event.plain_message(
+            yield event.plain_result(
                 "❌ 查询过程中发生错误，请检查日志或稍后重试。"
             )
 
     # ==================== 消息监听 ====================
     # 参考: https://astrbot.app/dev/plugin-minimal 消息事件章节
-    @on_message()
+    # 注意: 不要使用 @staticmethod。AstrBot v3.5.19+ 的插件加载器会将 handler
+    # 通过 functools.partial(raw_handler, star_cls) 绑定到插件实例, staticmethod
+    # 会被多传入一个 self 参数导致 TypeError。因此这里使用普通实例方法。
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_character_query(self, event: AstrMessageEvent):
         """监听纯文本消息，匹配角色名时回复详情卡片。
 
@@ -804,15 +1378,18 @@ class GenshinShowcasePlugin(Star):
             user_id = event.get_sender_id()
 
             # 检查是否有缓存的展示窗数据
-            if user_id not in self._user_showcase_cache:
+            if user_id not in _user_showcase_cache:
                 return
 
             msg_text = event.message_str.strip()
             if not msg_text:
                 return
 
-            # 获取该用户的角色名集合
-            characters = self._user_showcase_cache[user_id]
+            # 获取该用户的角色名集合（缓存结构: {uid, characters, ...}）
+            cache_entry = _user_showcase_cache.get(user_id)
+            if not cache_entry:
+                return
+            characters = cache_entry.get("characters", [])
             char_name_map = {}
             for char in characters:
                 char_name_map[char["name"]] = char
@@ -821,9 +1398,9 @@ class GenshinShowcasePlugin(Star):
             matched_char = None
             if msg_text in char_name_map:
                 matched_char = char_name_map[msg_text]
-            elif msg_text in self.alias_map:
+            elif msg_text in _alias_map:
                 # 通过别名映射查找标准名
-                standard_name = self.alias_map[msg_text]
+                standard_name = _alias_map[msg_text]
                 if standard_name in char_name_map:
                     matched_char = char_name_map[standard_name]
 
@@ -834,35 +1411,26 @@ class GenshinShowcasePlugin(Star):
                 f"角色卡片触发: user={user_id}, char={matched_char['name']}"
             )
 
-            # 提示正在生成
-            await event.send(
-                event.plain_message(f"⏳ 正在生成「{matched_char['name']}」的详情卡片...")
-            )
-
             # 合成卡片
             card_bytes = await generate_character_card(matched_char)
             if card_bytes is None:
-                await event.send(
-                    event.plain_message(
-                        "❌ 卡片生成失败，请稍后重试。"
-                    )
+                yield event.plain_result(
+                    "❌ 卡片生成失败，请稍后重试。"
                 )
                 return
 
-            # 通过AstrBot官方MessageChain发送图片（参考文转图规范）
-            # 禁止直接发送文件路径，必须使用消息组件
-            from astrbot.api.message_components import Image
-
-            image_component = Image.fromBytes(card_bytes)
-            await event.send(MessageChain([image_component]))
+            # 通过AstrBot官方API发送图片（参考文转图规范）
+            # 使用 Image.fromBytes 创建图片组件
+            image_component = Image.fromBytes(card_bytes.getvalue())
+            result = event.make_result()
+            result.chain.append(image_component)
+            yield result
 
         except Exception as e:
             logger.error(f"角色查询监听异常: {e}")
             try:
-                await event.send(
-                    event.plain_message(
-                        "❌ 角色卡片生成出错，请稍后重试。"
-                    )
+                yield event.plain_result(
+                    "❌ 角色卡片生成出错，请稍后重试。"
                 )
             except Exception:
                 pass
